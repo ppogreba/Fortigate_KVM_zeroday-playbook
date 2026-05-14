@@ -1,7 +1,6 @@
 ---
 - name: Build and Deploy Fortigates
   hosts: KVM_Host
-  connection: httpapi
   collections:
     - fortinet.fortiflexvm
   vars_files:
@@ -65,10 +64,10 @@
       ansible.builtin.expect:
         command: "virsh console {{ VM_NAME }}"
         responses: 
-          "login:": ["admin\r", "sleep 1"] 
-          "Password:": ["\r", "sleep 1"]
-          "New Password:": ["{{ FORTIGATE_ADMIN_PASS }}", "sleep 1"]
-          "Confirm Password:": ["{{ FORTIGATE_ADMIN_PASS }}", "sleep 3"]     
+          "login:": "admin\r" 
+          "Password:": "\r"
+          "New Password:": "{{ FORTIGATE_ADMIN_PASS }}"
+          "Confirm Password:": "{{ FORTIGATE_ADMIN_PASS }}"    
           "#": 
             - "config system interface\r"
             - "edit port4\r"
@@ -124,31 +123,35 @@
             - "next\r"
             - "end\r"
             - "exe api-user generate-key temp_user\r"
-            - "exe vm-license {{ fortiflex_result.entitlements.token }}\ry\r"
-          "Please enter current administrator password:": ["{{ FORTIGATE_ADMIN_PASS }}", "sleep 1"]
-          "The system is going down NOW !!": "sleep 10"
+            - "exe vm-license {{ fortiflex_result.entitlements[0].token }}\r"
+          "Do you want to continue\\? \\(y/n\\)": "y\r"
+          "Please enter current administrator password:": "{{ FORTIGATE_ADMIN_PASS }}"
+          "The system is going down NOW !!": "\r"
       register: console_output
     - name: Print Console Output
       ansible.builtin.debug:
         var: console_output.stdout_lines
-
     - name: extract API key
       ansible.builtin.set_fact:
         temp_api_key: "{{ console_output.stdout | regex_search('New API key:\\s*(\\S+)', '\\1') | first }}"
-
 
 - name: Configure Day Zero on Fortigates
   hosts: Fortigate
   connection: httpapi
   collections:
     - fortinet.fortios
-  vars_files:
-    - vars.yml
+  vars:
+    ansible_httpapi_session_key: 
+      access_token: "{{ hostvars['KVM_Host'].temp_api_key }}"
+    ansible_network_os: fortinet.fortios.fortios
+    ansible_log_path: /tmp/ansible.network.log
+    ansible_facts_modules: setup
   gather_facts: false
   tasks:
     - name: wait for Fortigate API to be ready
       ansible.builtin.uri:
-        uri: "https://{{ fortigate }}/"
+        url: "https://{{ fortigate }}/"
+        validate_certs: false
         status_code: 200
       register: result
       until: result.status == 200
@@ -162,7 +165,7 @@
     #   ansible.builtin.debug:
     #     var: encoded_fortigate_config
     - name: restore Fortinet Config from file
-      fortios_monitor:
+      fortinet.fortios.fortios_monitor:
         vdom: "root"
         selector: 'restore.system.config'
         params:
@@ -171,18 +174,18 @@
           file_content: "{{ encoded_fortigate_config }}"
 
 ## OPTION 2 Will not reset the box, but may have dependencies we need to test 
-    - name: Read and encode script file
-      ansible.builtin.set_fact:
-        encoded_fortigate_config: "{{ lookup('ansible.builtin.file', './fortigate.conf') | b64encode }}"
-    # - name: Display response
-    #   ansible.builtin.debug:
-    #     var: encoded_fortigate_config
-    - name: Run Fortinet Config script from file
-      fortios_monitor:
-        vdom: "root"
-        selector: 'upload.system.config-script'
-        params:
-          filename: "DayZero_Config_Script" ## name as it will appear on the fortigate
-          file_content: "{{ encoded_fortigate_config }}"
+#    - name: Read and encode script file
+#      ansible.builtin.set_fact:
+#        encoded_fortigate_config: "{{ lookup('ansible.builtin.file', './fortigate.conf') | b64encode }}"
+#    # - name: Display response
+#    #   ansible.builtin.debug:
+#    #     var: encoded_fortigate_config
+#    - name: Run Fortinet Config script from file
+#      fortinet.fortios.fortios_monitor:
+#        vdom: "root"
+#        selector: 'upload.system.config-script'
+#        params:
+#          filename: "DayZero_Config_Script" ## name as it will appear on the fortigate
+#          file_content: "{{ encoded_fortigate_config }}"
 
 ...
