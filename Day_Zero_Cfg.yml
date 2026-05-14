@@ -1,0 +1,188 @@
+---
+- name: Build and Deploy Fortigates
+  hosts: KVM_Host
+  connection: httpapi
+  collections:
+    - fortinet.fortiflexvm
+  vars_files:
+    - vars.yml
+  gather_facts: false
+  tasks:
+  ## The following plays just deploy the VM. 
+    - name: Copy image to libvirt directory
+      ansible.builtin.copy:
+        src: "{{ IMAGE_SRC }}"
+        dest: "{{ IMAGE_DST_DIR }}fortios_A.qcow2"
+        mode: "0644"
+        force: no
+      register: copy_results
+    - name: Display Copy copy_results
+      ansible.builtin.debug:
+        var: copy_results
+    - name: Create and start VM using virt-install
+      ansible.builtin.command: >
+        virt-install
+        --name "FortiGate"
+        --memory 2048
+        --vcpus 1
+        --disk "{{ IMAGE_DST_DIR }}fortios_A.qcow2",format=qcow2,bus=virtio
+        --disk path="{{ IMAGE_DST_DIR }}fortigate_LogDisk.raw",size=32,bus=virtio
+        --import
+        --os-variant rhel7-unknown
+        --graphics none
+        --network bridge=br0,model=virtio
+        --network bridge=FGT_LAN,model=virtio
+        --network bridge=HA_Sync,model=virtio
+        --network bridge=FGT_MGMT,model=virtio
+        --console pty,target_type=serial
+        --noautoconsole
+
+## This is the start of where I understand the other playbook ends.
+
+    - name: Get config group nexttoken
+      fortinet.fortiflexvm.fortiflexvm_groups_nexttoken_info:
+        # username and password is the API user and secret from IAM user in FortiCloud
+        username: "{{ username }}"
+        password: "{{ password }}"
+        # Please declare at least one of the following two arguments: accountId or configId.
+        # You can comment at most one argument that you don't want to specify. if you use both,
+        # the config is more specific and will future proof our deployment.
+        # My Id is 9483 which I got from running the command without the ID and getting it from the output
+        configId: 9483 
+        accountId: "{{ accountId }}"
+        folderPath: "My Assets"
+        status: ["ACTIVE", "PENDING"] # "ACTIVE", "PENDING", "STOPPED", "EXPIRED"
+      register: fortiflex_result 
+    - name: Display response
+      ansible.builtin.debug:
+        var: fortiflex_result.entitlements
+
+# The following consoles into the newly provisioned fortigate VM on the host
+# and adds configurations for the management interface, as well as a default route out
+# which is then used to license the box via FortiFlex cloud
+
+    - name: Connect to virsh console and execute commands
+      ansible.builtin.expect:
+        command: "virsh console {{ VM_NAME }}"
+        responses: 
+          "login:": ["admin\r", "sleep 1"] 
+          "Password:": ["\r", "sleep 1"]
+          "New Password:": ["{{ FORTIGATE_ADMIN_PASS }}", "sleep 1"]
+          "Confirm Password:": ["{{ FORTIGATE_ADMIN_PASS }}", "sleep 3"]     
+          "#": 
+            - "config system interface\r"
+            - "edit port4\r"
+            - "set mode static\r"
+            - "set ip {{ MGMT_VIP }} 255.255.255.0\r"
+            - "set alias MGMT\r"
+            - "set allowaccess https ssh snmp fgfm radius-acct\r"
+            - "set dedicated-to management\r"
+            - "set management-ip {{ MGMT_VIP }} 255.255.255.0\r"
+            - "set trust-ip-1 192.168.0.0 255.255.254.0\r"
+            - "set trust-ip-2 172.16.0.0 255.255.0.0\r"
+            - "next\r"
+            - "end\r"
+            - "config router static\r"
+            - "edit 0\r"
+            - "set gateway 10.10.11.1\r"
+            - "set device port4\r"
+            - "next\r"
+            - "end\r"
+            - "config system accprofile\r"
+            - "edit APIadmin\r"
+            - "set secfabgrp read\r"
+            - "set ftviewgrp read-write\r"
+            - "set authgrp read-write\r"
+            - "set sysgrp custom\r"
+            - "set netgrp read-write\r"
+            - "set loggrp read-write\r"
+            - "set fwgrp read-write\r"
+            - "set vpngrp read-write\r"
+            - "set utmgrp read-write\r"
+            - "set cli-diagnose enable\r"
+            - "set cli-get enable\r"
+            - "set cli-show enable\r"
+            - "set cli-exec enable\r"
+            - "set cli-config enable\r"
+            - "config sysgrp-permission\r"
+            - "set upd read-write\r"
+            - "set cfg read-write\r"
+            - "set mnt read-write\r"
+            - "end\r"
+            - "next \r"
+            - "end\r"
+            - "config system api-user\r"
+            - "edit temp_user\r"
+            - "set comments \"temp api access for initial config push via api, should not be here if everything worked correctly\"\r"
+            - "set accprofile APIadmin\r"
+            - "set vdom root\r"
+            - "config trusthost\r"
+            - "edit 1\r"
+            - "set ipv4-trusthost {{ Trusted_Host }}\r"
+            - "next\r"
+            - "end\r"
+            - "next\r"
+            - "end\r"
+            - "exe api-user generate-key temp_user\r"
+            - "exe vm-license {{ fortiflex_result.entitlements.token }}\ry\r"
+          "Please enter current administrator password:": ["{{ FORTIGATE_ADMIN_PASS }}", "sleep 1"]
+          "The system is going down NOW !!": "sleep 10"
+      register: console_output
+    - name: Print Console Output
+      ansible.builtin.debug:
+        var: console_output.stdout_lines
+
+    - name: extract API key
+      ansible.builtin.set_fact:
+        temp_api_key: "{{ console_output.stdout | regex_search('New API key:\\s*(\\S+)', '\\1') | first }}"
+
+
+- name: Configure Day Zero on Fortigates
+  hosts: Fortigate
+  connection: httpapi
+  collections:
+    - fortinet.fortios
+  vars_files:
+    - vars.yml
+  gather_facts: false
+  tasks:
+    - name: wait for Fortigate API to be ready
+      ansible.builtin.uri:
+        uri: "https://{{ fortigate }}/"
+        status_code: 200
+      register: result
+      until: result.status == 200
+      retries: 30
+      delay: 5
+## OPTION 1 will reboot the box after the restore. This is like a restore from backup 
+    - name: Read and encode script file
+      ansible.builtin.set_fact:
+        encoded_fortigate_config: "{{ lookup('ansible.builtin.file', './restore.conf') | b64encode }}"
+    # - name: Display response
+    #   ansible.builtin.debug:
+    #     var: encoded_fortigate_config
+    - name: restore Fortinet Config from file
+      fortios_monitor:
+        vdom: "root"
+        selector: 'restore.system.config'
+        params:
+          source: "upload"
+          scope: "global"
+          file_content: "{{ encoded_fortigate_config }}"
+
+## OPTION 2 Will not reset the box, but may have dependencies we need to test 
+    - name: Read and encode script file
+      ansible.builtin.set_fact:
+        encoded_fortigate_config: "{{ lookup('ansible.builtin.file', './fortigate.conf') | b64encode }}"
+    # - name: Display response
+    #   ansible.builtin.debug:
+    #     var: encoded_fortigate_config
+    - name: Run Fortinet Config script from file
+      fortios_monitor:
+        vdom: "root"
+        selector: 'upload.system.config-script'
+        params:
+          filename: "DayZero_Config_Script" ## name as it will appear on the fortigate
+          file_content: "{{ encoded_fortigate_config }}"
+
+...
