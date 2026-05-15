@@ -86,7 +86,7 @@
             - "set mode static"
             - "set ip {{ MGMT_VIP }} {{ MGMT_VIP_SUBNET }}"
             - "set alias MGMT"
-            - "set allowaccess https ssh snmp fgfm radius-acct"
+            - "set allowaccess ping https ssh snmp fgfm radius-acct"
             - "set dedicated-to management"
             - "set management-ip {{ MGMT_VIP }} {{ MGMT_VIP_SUBNET }}"
             - "set trust-ip-1 {{ trust_IP }}"
@@ -135,8 +135,11 @@
             - "exe api-user generate-key temp_user"
             - "exe vm-license-options count 10"
             - "exe vm-license-options interval 5"
-            - "exe vm-license {{ fortiflex_result.entitlements[0].token }}"
-          "Do you want to continue": "y"
+            - "exe vm-license {{ fortiflex_result.entitlements[0].token }}\ry\r"
+            - "\r"
+            - "\r"
+            - "\r"
+
           "Please enter current administrator password:": "{{ FORTIGATE_ADMIN_PASS }}"
           "Requesting FortiCare license token:": "\r"
           "VM license install succeeded. Rebooting firewall.": "\x1d"
@@ -150,7 +153,7 @@
         temp_api_key: "{{ console_output.stdout | regex_search('New API key:\\s*(\\S+)', '\\1') | first }}"
 
 - name: Configure Day Zero on Fortigates
-  hosts: "{{ VM_NAME }}"
+  hosts: FortiGate
   connection: httpapi
   collections:
     - fortinet.fortios
@@ -164,7 +167,7 @@
   tasks:
     - name: wait for Fortigate API to be ready
       ansible.builtin.uri:
-        url: "https://{{ fortigate }}/"
+        url: "https://FortiGate/"
         validate_certs: false
         status_code: 200
       register: result
