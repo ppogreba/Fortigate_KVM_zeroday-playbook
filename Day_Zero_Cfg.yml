@@ -14,7 +14,6 @@
       register: vm_check
       failed_when: false      # don't fail the task when virsh returns non-zero
       changed_when: false     # this is a read-only check, never "changed" 
-
     - name: Copy image to libvirt directory
       ansible.builtin.copy:
         src: "{{ IMAGE_SRC }}"
@@ -46,7 +45,7 @@
         --noautoconsole
       when: vm_check.rc != 0   # only run if dominfo didn't find the VM
 ## This is the start of where I understand the other playbook ends.
-
+#####################################################################
     - name: Get config group nexttoken
       fortinet.fortiflexvm.fortiflexvm_groups_nexttoken_info:
         # username and password is the API user and secret from IAM user in FortiCloud
@@ -100,7 +99,7 @@
             - "end"
             - "config system accprofile"
             - "edit APIadmin"
-            - "set secfabgrp read"
+            - "set secfabgrp read-write"
             - "set ftviewgrp read-write"
             - "set authgrp read-write"
             - "set sysgrp custom"
@@ -124,7 +123,7 @@
             - "config system api-user"
             - "edit temp_user"
             - "set comments \"temp api access for initial config push via api, should not be here if everything worked correctly\""
-            - "set accprofile APIadmin"
+            - "set accprofile super_admin"
             - "config trusthost"
             - "edit 1"
             - "set ipv4-trusthost {{ trust_IP }}"
@@ -138,8 +137,6 @@
             - "exe vm-license {{ fortiflex_result.entitlements[0].token }}\ry\r"
             - "\r"
             - "\r"
-            - "\r"
-
           "Please enter current administrator password:": "{{ FORTIGATE_ADMIN_PASS }}"
           "Requesting FortiCare license token:": "\r"
           "VM license install succeeded. Rebooting firewall.": "\x1d"
@@ -152,6 +149,12 @@
       ansible.builtin.set_fact:
         temp_api_key: "{{ console_output.stdout | regex_search('New API key:\\s*(\\S+)', '\\1') | first }}"
 
+    - name: Fail if API key wasn't captured
+      ansible.builtin.fail:
+        msg: "Could not extract API key from console output — inspect /var/log/libvirt/qemu/{{ VM_NAME }}-serial.log"
+      when: temp_api_key | length == 0
+
+## will reboot the box after the restore. This is like a restore from backup 
 - name: Configure Day Zero on Fortigates
   hosts: FortiGate
   connection: httpapi
@@ -159,28 +162,31 @@
     - fortinet.fortios
   vars:
     ansible_httpapi_session_key: 
-      access_token: "{{ hostvars['KVM_Host'].temp_api_key }}"
-    ansible_network_os: fortinet.fortios.fortios
-    ansible_log_path: /tmp/ansible.network.log
-    ansible_facts_modules: setup
+      access_token: "{{ hostvars['localhost'].temp_api_key }}"
+  vars_files:
+    - vars.yml
   gather_facts: false
   tasks:
     - name: wait for Fortigate API to be ready
       ansible.builtin.uri:
-        url: "https://FortiGate/"
+        url: "https://{{ MGMT_VIP }}/api/v2/monitor/system/status"
+        headers:
+          Authorization: "Bearer {{ hostvars['localhost'].temp_api_key }}"
         validate_certs: false
         status_code: 200
       register: result
       until: result.status == 200
-      retries: 30
+      retries: 60
       delay: 5
-## OPTION 1 will reboot the box after the restore. This is like a restore from backup 
+      delegate_to: localhost
     - name: Read and encode script file
       ansible.builtin.set_fact:
         encoded_fortigate_config: "{{ lookup('ansible.builtin.file', './restore.conf') | b64encode }}"
     # - name: Display response
     #   ansible.builtin.debug:
     #     var: encoded_fortigate_config
+    - name: Reset httpapi connection before restore
+      ansible.builtin.meta: reset_connection
     - name: restore Fortinet Config from file
       fortinet.fortios.fortios_monitor:
         vdom: "root"
@@ -189,20 +195,46 @@
           source: "upload"
           scope: "global"
           file_content: "{{ encoded_fortigate_config }}"
+      
 
-## OPTION 2 Will not reset the box, but may have dependencies we need to test 
-#    - name: Read and encode script file
-#      ansible.builtin.set_fact:
-#        encoded_fortigate_config: "{{ lookup('ansible.builtin.file', './fortigate.conf') | b64encode }}"
-#    # - name: Display response
-#    #   ansible.builtin.debug:
-#    #     var: encoded_fortigate_config
-#    - name: Run Fortinet Config script from file
-#      fortinet.fortios.fortios_monitor:
-#        vdom: "root"
-#        selector: 'upload.system.config-script'
-#        params:
-#          filename: "DayZero_Config_Script" ## name as it will appear on the fortigate
-#          file_content: "{{ encoded_fortigate_config }}"
+# Will not reset the box and allows for config changes with FGT script 
+- name: Configure Day two items on Fortigates
+  hosts: FortiGate
+  connection: httpapi
+  collections:
+    - fortinet.fortios
+  vars:
+    ansible_httpapi_session_key: 
+      access_token: "{{ TEST_FGT_API_KEY }}"
+  vars_files:
+    - vars.yml
+  gather_facts: false
+  tasks:
+    - name: wait for Fortigate API to be ready
+      ansible.builtin.uri:
+        url: "https://{{ MGMT_VIP }}/api/v2/monitor/system/status"
+        headers:
+          Authorization: "Bearer {{ TEST_FGT_API_KEY }}"
+        validate_certs: false
+        status_code: 200
+      register: result
+      until: result.status == 200
+      retries: 60
+      delay: 5
+      delegate_to: localhost
+    - name: Read and encode script file
+      ansible.builtin.set_fact:
+        encoded_fortigate_script: "{{ lookup('ansible.builtin.file', './fortigate.conf') | b64encode }}"
+    # - name: Display response
+    #   ansible.builtin.debug:
+    #     var: encoded_fortigate_script
+    - name: Run Fortinet Config script from file
+      fortinet.fortios.fortios_monitor:
+        vdom: "root"
+        selector: 'upload.system.config-script'
+        params:
+          filename: "Changes made Day2" ## name as it will appear on the fortigate
+          file_content: "{{ encoded_fortigate_script }}"
+      
 
 ...
